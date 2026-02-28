@@ -5,7 +5,9 @@
 from collections.abc import Iterable
 from itertools import islice
 
+import os
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
@@ -104,6 +106,8 @@ from .utils import (
 logger = init_logger(__name__)
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
+
+_VLLM_Q35_TC_OP = os.getenv("VLLM_Q35_TC_OP", "0") == "1"
 
 
 def fi_chunk_gated_delta_rule(
@@ -1513,6 +1517,33 @@ def fused_gdn_gating_kernel(
         beta_output + off, blk_beta_output.to(beta_output.dtype.element_ty), mask=mask
     )
 
+def _fused_gdn_gating_torch_impl(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    beta: float,
+    threshold: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x = a.to(torch.float32) + dt_bias.to(torch.float32)  # (B,H)
+    sp = F.softplus(x, beta=beta, threshold=threshold)   # (B,H)
+    g = -torch.exp(A_log.to(torch.float32)).unsqueeze(0) * sp.unsqueeze(0)  # (1,B,H) fp32
+    beta_output = torch.sigmoid(b.to(torch.float32)).to(b.dtype).unsqueeze(0)  # (1,B,H) dtype(b)
+    return g, beta_output
+
+# compiled function cache (per-process)
+_COMPILED_FUSED_GDN_GATING: dict[tuple[float, float, str], callable] = {}
+
+def _get_compiled_fused_gdn_gating(beta: float, threshold: float, mode: str = "default"):
+    key = (float(beta), float(threshold), mode)
+    fn = _COMPILED_FUSED_GDN_GATING.get(key)
+    if fn is None:
+        # capture beta/threshold as constants in the graph
+        def _fn(A_log, a, b, dt_bias):
+            return _fused_gdn_gating_torch_impl(A_log, a, b, dt_bias, beta=beta, threshold=threshold)
+        fn = torch.compile(_fn, mode=mode, fullgraph=False)
+        _COMPILED_FUSED_GDN_GATING[key] = fn
+    return fn
 
 def fused_gdn_gating(
     A_log: torch.Tensor,
@@ -1526,8 +1557,15 @@ def fused_gdn_gating(
     Fused computation of g and beta for Gated Delta Net.
     g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
     beta_output = b.sigmoid()
-    TODO maybe use torch.compile to replace this triton kernel
     """
+    if _VLLM_Q35_TC_OP:
+        if not hasattr(fused_gdn_gating, "_tc_logged"):
+            fused_gdn_gating._tc_logged = True
+            print(f"[Q35] fused_gdn_gating using torch.compile (pid={os.getpid()})", flush=True)
+
+        compiled = _get_compiled_fused_gdn_gating(beta=beta, threshold=threshold, mode="default")
+        return compiled(A_log, a, b, dt_bias)
+
     batch, num_heads = a.shape
     seq_len = 1
     grid = (batch, seq_len, triton.cdiv(num_heads, 8))

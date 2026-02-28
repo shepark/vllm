@@ -8,11 +8,17 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
+import os
+from functools import lru_cache
+
 import torch
 
 from vllm.triton_utils import tl, triton
 
 from .op import exp
+
+
+_VLLM_Q35_TC_OP = os.getenv("VLLM_Q35_TC_OP", "0") == "1"
 
 
 @triton.heuristics(
@@ -175,6 +181,143 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         p_beta += HV * (V if IS_BETA_HEADWISE else 1)
 
 
+# ==========================================================
+# torch.compile version (guarded by env)
+# ==========================================================
+
+def _is_stream_capturing() -> bool:
+    # Safe query during CUDA graph capture; does not launch kernels.
+    try:
+        return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+    except Exception:
+        return False
+
+
+def _tc_supported_gated_delta_rule_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor,
+    inplace_final_state: bool,
+    cu_seqlens: torch.Tensor | None,
+    ssm_state_indices: torch.Tensor | None,
+    num_accepted_tokens: torch.Tensor | None,
+    use_qk_l2norm_in_kernel: bool,
+    *,
+    is_kda: bool,
+) -> bool:
+    # Observed + warmup path constraints
+    if cu_seqlens is None or ssm_state_indices is None:
+        return False
+    if num_accepted_tokens is not None:
+        return False
+    if not inplace_final_state:
+        return False
+    if is_kda:
+        return False
+    if beta.ndim == v.ndim:  # headwise beta not supported
+        return False
+    if q.shape[0] != 1:
+        return False
+    if ssm_state_indices.ndim != 1:
+        return False
+
+    # Avoid ANY GPU ops / sync inside capture.
+    T_total = q.shape[1]
+    if cu_seqlens.numel() != T_total + 1:
+        return False
+
+    # Identity cu_seqlens check: only do it when it's safe.
+    # During CUDA graph capture, torch.equal on CUDA will error.
+    if (not _is_stream_capturing()) and (cu_seqlens.device.type == "cpu"):
+        exp_cu = torch.arange(T_total + 1, dtype=cu_seqlens.dtype, device=cu_seqlens.device)
+        if not torch.equal(cu_seqlens, exp_cu):
+            return False
+    # If cu_seqlens is CUDA or we are capturing, skip this check.
+
+    if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+            and g.is_contiguous() and beta.is_contiguous()):
+        return False
+    if initial_state is None:
+        return False
+    if initial_state.dtype != torch.float32:
+        return False
+    return True
+
+
+@lru_cache(maxsize=16)
+def _get_compiled_gated_delta_rule_fwd(scale: float, use_qk_l2norm_in_kernel: bool):
+    def _impl(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor,
+        ssm_state_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # q,k: (1,T,H,K)  v: (1,T,HV,V)  g,beta: (1,T,HV)
+        _, T, H, _K = q.shape
+        HV = v.shape[2]
+        _V = v.shape[3]
+
+        group = HV // H
+        q_hv = q.repeat_interleave(group, dim=2)  # (1,T,HV,K)
+        k_hv = k.repeat_interleave(group, dim=2)  # (1,T,HV,K)
+
+        idx = ssm_state_indices.to(torch.int64)  # (T,)
+        H_batch = initial_state.index_select(0, idx)  # (T,HV,V,K) fp32
+
+        b_q = q_hv[0].to(torch.float32)  # (T,HV,K)
+        b_k = k_hv[0].to(torch.float32)  # (T,HV,K)
+        b_v = v[0].to(torch.float32)     # (T,HV,V)
+        b_beta = beta[0].to(torch.float32).unsqueeze(-1)  # (T,HV,1)
+        b_g = g[0].to(torch.float32).unsqueeze(-1).unsqueeze(-1)  # (T,HV,1,1)
+
+        if use_qk_l2norm_in_kernel:
+            q_norm = torch.sqrt((b_q * b_q).sum(dim=-1, keepdim=True) + 1e-6)
+            k_norm = torch.sqrt((b_k * b_k).sum(dim=-1, keepdim=True) + 1e-6)
+            b_q = b_q / q_norm
+            b_k = b_k / k_norm
+
+        b_q = b_q * float(scale)
+
+        H_batch = H_batch * torch.exp(b_g)
+        pred = torch.einsum("thvk,thk->thv", H_batch, b_k)
+        b_v = (b_v - pred) * b_beta
+        H_new = H_batch + b_v.unsqueeze(-1) * b_k.unsqueeze(-2)
+
+        out = torch.einsum("thvk,thk->thv", H_new, b_q).to(v.dtype)  # (T,HV,V)
+        o = out.unsqueeze(0)  # (1,T,HV,V)
+
+        # inplace update
+        initial_state.index_copy_(0, idx, H_new)
+
+        return o, initial_state
+
+    return torch.compile(_impl, fullgraph=False)
+
+
+def fused_recurrent_gated_delta_rule_fwd_tc(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    inplace_final_state: bool = True,
+    cu_seqlens: torch.LongTensor | None = None,
+    ssm_state_indices: torch.Tensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    compiled = _get_compiled_gated_delta_rule_fwd(float(scale), bool(use_qk_l2norm_in_kernel))
+    return compiled(q, k, v, g, beta, initial_state, ssm_state_indices)
+
+
 def fused_recurrent_gated_delta_rule_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -189,6 +332,41 @@ def fused_recurrent_gated_delta_rule_fwd(
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+
+    # torch.compile fast-path, only when env enabled
+    if _VLLM_Q35_TC_OP:
+        if not hasattr(fused_recurrent_gated_delta_rule_fwd, "_tc_logged"):
+            fused_recurrent_gated_delta_rule_fwd._tc_logged = True
+            print(f"[Q35] fused_recurrent_gated_delta_rule_fwd using torch.compile (pid={os.getpid()})", flush=True)
+
+        if _tc_supported_gated_delta_rule_fwd(q=q,
+                                              k=k,
+                                              v=v,
+                                              g=g,
+                                              beta=beta,
+                                              initial_state=initial_state,
+                                              inplace_final_state=inplace_final_state,
+                                              cu_seqlens=cu_seqlens,
+                                              ssm_state_indices=ssm_state_indices,
+                                              num_accepted_tokens=num_accepted_tokens,
+                                              use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                                              is_kda=False,
+                                              ):
+            return fused_recurrent_gated_delta_rule_fwd_tc(q=q,
+                                                           k=k,
+                                                           v=v,
+                                                           g=g,
+                                                           beta=beta,
+                                                           scale=scale,
+                                                           initial_state=initial_state,
+                                                           inplace_final_state=inplace_final_state,
+                                                           cu_seqlens=cu_seqlens,
+                                                           ssm_state_indices=ssm_state_indices,
+                                                           num_accepted_tokens=num_accepted_tokens,
+                                                           use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                                                           )
+
+    # ---- original Triton path below ----
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
